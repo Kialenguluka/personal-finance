@@ -1,0 +1,801 @@
+# Plano de Arquitectura de Software — Sistema de Gestão Financeira Pessoal
+
+**Disciplina:** Engenharia de Software II — Lab #04 · 2.º Conjunto  
+**Instituição:** ISPTEC — Licenciatura em Engenharia Informática 2025/2026  
+**Docente:** Judson Paiva
+
+---
+
+## 1. Visão Geral do Sistema
+
+O Sistema de Gestão Financeira Pessoal permite ao utilizador registar e categorizar receitas e despesas, definir orçamentos mensais por categoria, criar objectivos de poupança e acompanhar a sua saúde financeira através de um dashboard analítico com gráficos e relatórios exportáveis.
+
+### Proposta de valor
+
+> O utilizador consegue responder em segundos a: *"Quanto gastei em alimentação este mês? Estou dentro do orçamento? Estou a poupar para o meu objectivo?"*
+
+### Stack tecnológica
+
+| Camada | Tecnologia | Observações |
+|---|---|---|
+| Frontend | Angular 17+ | Angular Material, i18n nativo, Chart.js para gráficos |
+| Backend | PHP 8.x puro | Sem frameworks, PDO, JWT manual |
+| Base de dados | MySQL / MariaDB | 7 tabelas relacionais, CRUD completo |
+| Comunicação | HTTP/JSON | REST, Bearer Token (JWT) |
+| API externa | ExchangeRate API | Conversão AOA / USD / EUR em tempo real |
+
+### Tipos de utilizador
+
+| Role | Permissões |
+|---|---|
+| `user` | Gerir as suas próprias contas, categorias, transacções, orçamentos, objectivos e relatórios |
+| `admin` | Acesso a todos os utilizadores, gestão global, relatórios agregados |
+
+> **Nota:** Para uma aplicação financeira pessoal, o perfil `user` é o centro do sistema. O perfil `admin` existe para cumprir o requisito de distinção de tipos de utilizador.
+
+---
+
+## 2. Arquitectura em Camadas
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Browser — Angular SPA                                  │
+│  Components → Services → HttpClient → Chart.js          │
+└────────────────────┬────────────────────────────────────┘
+                     │ HTTP Request (JSON + JWT)
+┌────────────────────▼────────────────────────────────────┐
+│  PHP Backend                                            │
+│  index.php → Router → Middleware → Controller → Model  │
+└────────────────────┬────────────────────────────────────┘
+                     │ PDO
+┌────────────────────▼────────────────────────────────────┐
+│  MySQL — Base de dados relacional                       │
+└─────────────────────────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────┐
+│  ExchangeRate API (externa) — via CurrencyService       │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Módulos Angular (Frontend)
+
+### 3.1 CoreModule *(singleton)*
+
+| Serviço / Infra | Responsabilidade |
+|---|---|
+| `AuthService` | Sessão, token, perfil do utilizador |
+| `TransactionStateService` | Estado reactivo das transacções (BehaviorSubject) |
+| `CurrencyService` | ExchangeRate API, conversão AOA/USD/EUR, caching |
+| `ThemeService` | Toggle claro/escuro, persistência em localStorage |
+| `I18nService` | Idioma activo (PT/EN), carregamento de JSON |
+| `TokenInterceptor` | Injector automático do Bearer JWT |
+| `AuthGuard` | Protecção de rotas para utilizadores autenticados |
+| `AdminGuard` | Protecção de rotas exclusivas do administrador |
+
+### 3.2 SharedModule *(reutilizável)*
+
+| Componente / Pipe | Função |
+|---|---|
+| `TransactionItemComponent` | Linha de transacção (ícone, descrição, valor, data) |
+| `AmountBadgeComponent` | Exibe valor com cor verde (receita) ou vermelho (despesa) |
+| `BudgetProgressComponent` | Barra de progresso do orçamento (% utilizado) |
+| `PeriodSelectorComponent` | Seletor de mês/ano reutilizável em múltiplos ecrãs |
+| `CategoryIconComponent` | Ícone da categoria com cor personalizada |
+| `EmptyStateComponent` | Estado vazio genérico com ícone e mensagem |
+| `ConfirmDialogComponent` | Diálogo de confirmação para acções destrutivas |
+| `CurrencyFormatPipe` | Formata valores com a divisa activa (`pure: false`) |
+| `CategoryColorPipe` | Retorna a cor CSS associada à categoria |
+
+### 3.3 Módulos de funcionalidade
+
+| Módulo | Rotas | Lazy |
+|---|---|---|
+| `AuthModule` | `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password` | Não |
+| `DashboardModule` | `/` | Não |
+| `TransactionsModule` | `/transactions`, `/transactions/new`, `/transactions/:id/edit` | Sim |
+| `AccountsModule` | `/accounts`, `/accounts/new`, `/accounts/:id/edit` | Sim |
+| `CategoriesModule` | `/categories` | Sim |
+| `BudgetsModule` | `/budgets` | Sim |
+| `GoalsModule` | `/goals`, `/goals/new`, `/goals/:id` | Sim |
+| `ReportsModule` | `/reports` | Sim |
+| `AdminModule` | `/admin/**` | Sim |
+| `ProfileModule` | `/profile` | Sim |
+
+---
+
+## 4. Base de Dados
+
+### 4.1 Diagrama de entidades (7 tabelas)
+
+```
+users ──────┬──── password_resets
+            │
+            ├──── accounts ────── transactions ──── categories
+            │                           │
+            ├──── categories ───────────┘
+            │
+            ├──── budgets ──── categories
+            │
+            └──── goals
+```
+
+### 4.2 Definição das tabelas
+
+```sql
+-- Utilizadores
+CREATE TABLE users (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    name           VARCHAR(100) NOT NULL,
+    email          VARCHAR(150) NOT NULL UNIQUE,
+    password_hash  VARCHAR(255) NOT NULL,
+    role           ENUM('user','admin') DEFAULT 'user',
+    preferred_lang ENUM('pt','en') DEFAULT 'pt',
+    currency       VARCHAR(3) DEFAULT 'AOA',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Recuperação de senha
+CREATE TABLE password_resets (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    user_id    INT NOT NULL,
+    token      VARCHAR(255) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at    TIMESTAMP NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Contas financeiras (ex.: Carteira, Conta BFA, Conta BAI)
+CREATE TABLE accounts (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    user_id      INT NOT NULL,
+    name         VARCHAR(100) NOT NULL,
+    type         ENUM('cash','bank','savings','investment') DEFAULT 'cash',
+    balance      DECIMAL(15,2) NOT NULL DEFAULT 0.00,
+    currency     VARCHAR(3) DEFAULT 'AOA',
+    color        VARCHAR(7) DEFAULT '#2E7D32',  -- cor HEX do cartão
+    is_active    TINYINT(1) DEFAULT 1,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Categorias (receita ou despesa, por utilizador)
+CREATE TABLE categories (
+    id       INT AUTO_INCREMENT PRIMARY KEY,
+    user_id  INT NOT NULL,
+    name     VARCHAR(100) NOT NULL,
+    type     ENUM('income','expense') NOT NULL,
+    icon     VARCHAR(50) DEFAULT 'attach_money',   -- nome do ícone Material
+    color    VARCHAR(7)  DEFAULT '#1565C0',
+    is_active TINYINT(1) DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Transacções
+CREATE TABLE transactions (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    account_id  INT NOT NULL,
+    category_id INT NOT NULL,
+    type        ENUM('income','expense') NOT NULL,
+    amount      DECIMAL(15,2) NOT NULL,
+    description VARCHAR(255),
+    date        DATE NOT NULL,
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id)     REFERENCES users(id)       ON DELETE CASCADE,
+    FOREIGN KEY (account_id)  REFERENCES accounts(id)    ON DELETE RESTRICT,
+    FOREIGN KEY (category_id) REFERENCES categories(id)  ON DELETE RESTRICT
+);
+
+-- Orçamentos mensais por categoria
+CREATE TABLE budgets (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    category_id INT NOT NULL,
+    month       TINYINT NOT NULL,   -- 1–12
+    year        SMALLINT NOT NULL,
+    amount      DECIMAL(15,2) NOT NULL,
+    UNIQUE KEY uq_budget (user_id, category_id, month, year),
+    FOREIGN KEY (user_id)     REFERENCES users(id)      ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+);
+
+-- Objectivos de poupança
+CREATE TABLE goals (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    user_id          INT NOT NULL,
+    name             VARCHAR(150) NOT NULL,
+    description      TEXT,
+    target_amount    DECIMAL(15,2) NOT NULL,
+    current_amount   DECIMAL(15,2) NOT NULL DEFAULT 0.00,
+    deadline         DATE,
+    icon             VARCHAR(50) DEFAULT 'flag',
+    color            VARCHAR(7)  DEFAULT '#E65100',
+    status           ENUM('active','completed','cancelled') DEFAULT 'active',
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+```
+
+> **Decisões arquitecturais importantes:**
+>
+> **`ON DELETE RESTRICT` nas transacções** — ao contrário de um e-commerce, numa aplicação financeira não faz sentido eliminar uma conta se ela ainda tiver transacções associadas. A integridade do histórico financeiro tem prioridade.
+>
+> **`balance` em `accounts`** — o saldo é mantido actualizado pelo backend sempre que uma transacção é criada, editada ou eliminada, evitando recalcular a soma total a cada pedido.
+>
+> **Constraint `UNIQUE` em `budgets`** — garante que apenas existe um orçamento por utilizador, por categoria, por mês e ano.
+
+---
+
+## 5. Estrutura de Código
+
+### 5.1 Frontend — Angular
+
+```
+src/
+├── app/
+│   ├── core/
+│   │   ├── services/
+│   │   │   ├── auth.service.ts
+│   │   │   ├── transaction-state.service.ts   # BehaviorSubject global
+│   │   │   ├── currency.service.ts            # ExchangeRate API
+│   │   │   ├── theme.service.ts
+│   │   │   └── i18n.service.ts
+│   │   ├── interceptors/
+│   │   │   └── token.interceptor.ts
+│   │   ├── guards/
+│   │   │   ├── auth.guard.ts
+│   │   │   └── admin.guard.ts
+│   │   ├── models/
+│   │   │   ├── user.model.ts
+│   │   │   ├── account.model.ts
+│   │   │   ├── category.model.ts
+│   │   │   ├── transaction.model.ts
+│   │   │   ├── budget.model.ts
+│   │   │   ├── goal.model.ts
+│   │   │   └── api-response.model.ts
+│   │   └── core.module.ts
+│   │
+│   ├── shared/
+│   │   ├── components/
+│   │   │   ├── transaction-item/
+│   │   │   ├── amount-badge/
+│   │   │   ├── budget-progress/
+│   │   │   ├── period-selector/
+│   │   │   ├── category-icon/
+│   │   │   ├── empty-state/
+│   │   │   └── confirm-dialog/
+│   │   ├── pipes/
+│   │   │   ├── currency-format.pipe.ts        # pure: false
+│   │   │   └── category-color.pipe.ts
+│   │   └── shared.module.ts
+│   │
+│   ├── layouts/
+│   │   ├── main-layout/
+│   │   │   ├── main-layout.component.ts
+│   │   │   ├── main-layout.component.html
+│   │   │   ├── main-layout.component.scss
+│   │   │   └── components/
+│   │   │       ├── sidebar/                   # nav lateral fixa
+│   │   │       └── topbar/                    # barra superior (perfil, tema, idioma)
+│   │   └── auth-layout/                       # layout simples para auth
+│   │
+│   ├── modules/
+│   │   ├── auth/
+│   │   │   ├── components/
+│   │   │   │   ├── login/
+│   │   │   │   ├── register/
+│   │   │   │   ├── forgot-password/
+│   │   │   │   └── reset-password/
+│   │   │   ├── services/
+│   │   │   │   └── auth-api.service.ts
+│   │   │   └── auth.module.ts
+│   │   │
+│   │   ├── dashboard/
+│   │   │   ├── components/
+│   │   │   │   ├── dashboard/
+│   │   │   │   ├── balance-card/              # saldo total por conta
+│   │   │   │   ├── summary-cards/             # receitas/despesas do mês
+│   │   │   │   ├── expense-chart/             # donut chart por categoria
+│   │   │   │   ├── cashflow-chart/            # linha mensal receita vs despesa
+│   │   │   │   └── recent-transactions/       # últimas 5 transacções
+│   │   │   ├── services/
+│   │   │   │   └── dashboard-api.service.ts
+│   │   │   └── dashboard.module.ts
+│   │   │
+│   │   ├── transactions/
+│   │   │   ├── components/
+│   │   │   │   ├── transaction-list/
+│   │   │   │   └── transaction-form/          # criar e editar
+│   │   │   ├── services/
+│   │   │   │   └── transactions-api.service.ts
+│   │   │   └── transactions.module.ts
+│   │   │
+│   │   ├── accounts/
+│   │   │   ├── components/
+│   │   │   │   ├── account-list/
+│   │   │   │   └── account-form/
+│   │   │   ├── services/
+│   │   │   │   └── accounts-api.service.ts
+│   │   │   └── accounts.module.ts
+│   │   │
+│   │   ├── categories/
+│   │   │   ├── components/
+│   │   │   │   └── categories-page/
+│   │   │   ├── services/
+│   │   │   │   └── categories-api.service.ts
+│   │   │   └── categories.module.ts
+│   │   │
+│   │   ├── budgets/
+│   │   │   ├── components/
+│   │   │   │   └── budgets-page/
+│   │   │   ├── services/
+│   │   │   │   └── budgets-api.service.ts
+│   │   │   └── budgets.module.ts
+│   │   │
+│   │   ├── goals/
+│   │   │   ├── components/
+│   │   │   │   ├── goal-list/
+│   │   │   │   ├── goal-form/
+│   │   │   │   └── goal-detail/               # progresso + depósito
+│   │   │   ├── services/
+│   │   │   │   └── goals-api.service.ts
+│   │   │   └── goals.module.ts
+│   │   │
+│   │   ├── reports/
+│   │   │   ├── components/
+│   │   │   │   └── reports-page/
+│   │   │   ├── services/
+│   │   │   │   └── reports-api.service.ts
+│   │   │   └── reports.module.ts
+│   │   │
+│   │   ├── admin/                             # lazy-loaded, AdminGuard
+│   │   │   ├── components/
+│   │   │   │   ├── admin-dashboard/
+│   │   │   │   └── admin-users/
+│   │   │   └── admin.module.ts
+│   │   │
+│   │   └── profile/
+│   │       ├── components/
+│   │       │   ├── profile-page/
+│   │       │   └── change-password/
+│   │       └── profile.module.ts
+│   │
+│   ├── i18n/
+│   │   ├── pt.json
+│   │   └── en.json
+│   │
+│   ├── app-routing.module.ts
+│   ├── app.module.ts
+│   └── app.component.ts
+│
+└── styles/
+    ├── themes.scss                            # variáveis light/dark
+    └── global.scss
+```
+
+### 5.2 Backend — PHP
+
+```
+api/
+├── config/
+│   ├── database.php          # PDO singleton
+│   └── app.php               # constantes (JWT_SECRET, API_KEY, etc.)
+├── models/
+│   ├── User.php
+│   ├── Account.php
+│   ├── Category.php
+│   ├── Transaction.php       # actualiza saldo da conta ao criar/editar/eliminar
+│   ├── Budget.php
+│   └── Goal.php
+├── controllers/
+│   ├── AuthController.php
+│   ├── AccountController.php
+│   ├── CategoryController.php
+│   ├── TransactionController.php
+│   ├── BudgetController.php
+│   ├── GoalController.php
+│   ├── DashboardController.php
+│   ├── ReportController.php
+│   └── AdminController.php
+├── middleware/
+│   ├── AuthMiddleware.php     # valida JWT, injeta $userId e $userRole
+│   ├── AdminMiddleware.php    # verifica role === 'admin'
+│   └── CorsMiddleware.php
+├── helpers/
+│   ├── Response.php           # json_response(), error_response()
+│   ├── JWT.php                # encode() / decode() com hash_hmac SHA-256
+│   ├── Validator.php
+│   └── Export.php             # CSV e PDF
+├── routes/
+│   └── api.php
+├── index.php                  # entry point
+└── .htaccess
+```
+
+---
+
+## 6. API Endpoints
+
+### Autenticação — `/api/auth`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `POST` | `/auth/register` | Pública | Criar conta |
+| `POST` | `/auth/login` | Pública | Login, retorna JWT |
+| `POST` | `/auth/logout` | JWT | Invalidar token |
+| `POST` | `/auth/forgot-password` | Pública | Token de reset |
+| `POST` | `/auth/reset-password` | Pública | Nova senha |
+
+### Contas — `/api/accounts`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/accounts` | JWT | Listar contas do utilizador |
+| `POST` | `/accounts` | JWT | Criar conta |
+| `PUT` | `/accounts/{id}` | JWT | Editar conta |
+| `DELETE` | `/accounts/{id}` | JWT | Eliminar conta (se sem transacções) |
+
+### Categorias — `/api/categories`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/categories` | JWT | Listar categorias (`?type=income\|expense`) |
+| `POST` | `/categories` | JWT | Criar categoria |
+| `PUT` | `/categories/{id}` | JWT | Editar categoria |
+| `DELETE` | `/categories/{id}` | JWT | Eliminar categoria (se sem transacções) |
+
+### Transacções — `/api/transactions`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/transactions` | JWT | Listagem paginada com filtros |
+| `POST` | `/transactions` | JWT | Criar transacção (actualiza saldo) |
+| `PUT` | `/transactions/{id}` | JWT | Editar transacção (reajusta saldo) |
+| `DELETE` | `/transactions/{id}` | JWT | Eliminar (reverte saldo) |
+| `GET` | `/transactions/summary` | JWT | Totais do período (receita, despesa, saldo) |
+
+> **Filtros disponíveis em `GET /transactions`:** `?type=`, `?category_id=`, `?account_id=`, `?date_from=`, `?date_to=`, `?page=`, `?limit=`, `?search=`
+
+### Orçamentos — `/api/budgets`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/budgets` | JWT | Orçamentos do mês (`?month=&year=`) |
+| `POST` | `/budgets` | JWT | Criar orçamento |
+| `PUT` | `/budgets/{id}` | JWT | Editar orçamento |
+| `DELETE` | `/budgets/{id}` | JWT | Eliminar orçamento |
+| `GET` | `/budgets/status` | JWT | Orçamento vs gasto real por categoria |
+
+### Objectivos — `/api/goals`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/goals` | JWT | Listar objectivos |
+| `POST` | `/goals` | JWT | Criar objectivo |
+| `PUT` | `/goals/{id}` | JWT | Editar objectivo |
+| `DELETE` | `/goals/{id}` | JWT | Eliminar objectivo |
+| `POST` | `/goals/{id}/deposit` | JWT | Depositar valor no objectivo |
+
+### Dashboard — `/api/dashboard`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/dashboard/summary` | JWT | Saldo total, receitas/despesas do mês |
+| `GET` | `/dashboard/by-category` | JWT | Despesas agrupadas por categoria (`?month=&year=`) |
+| `GET` | `/dashboard/cashflow` | JWT | Receitas vs despesas por mês (últimos 6 meses) |
+
+### Relatórios — `/api/reports`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/reports/summary` | JWT | Resumo do período personalizado |
+| `GET` | `/reports/export` | JWT | Exportação `?format=csv\|pdf&date_from=&date_to=` |
+
+### Administração — `/api/admin`
+
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/admin/users` | Admin | Listar todos os utilizadores |
+| `PUT` | `/admin/users/{id}` | Admin | Editar role de utilizador |
+| `GET` | `/admin/stats` | Admin | Estatísticas globais do sistema |
+
+---
+
+## 7. Componentes chave do Frontend
+
+### 7.1 `DashboardComponent` — ecrã principal
+
+```
+┌─────────────────────────────────────────────────────┐
+│  SALDO TOTAL: 450.000 AOA         [Mês: Mai 2026 ▾] │
+├──────────────┬──────────────┬───────────────────────┤
+│ Receitas     │ Despesas     │ Saldo do mês           │
+│ +850.000 AOA │ -400.000 AOA │ +450.000 AOA           │
+├──────────────┴──────────────┴───────────────────────┤
+│  [Donut chart: despesas por categoria]               │
+│  [Line chart: cashflow últimos 6 meses]              │
+├─────────────────────────────────────────────────────┤
+│  Últimas transacções (5)      [Ver todas →]          │
+│  • Supermercado    -12.500    Hoje                   │
+│  • Salário        +250.000    01/05                  │
+└─────────────────────────────────────────────────────┘
+```
+
+**Implementação com Chart.js:**
+
+```typescript
+// dashboard/components/expense-chart/expense-chart.component.ts
+@Component({ selector: 'app-expense-chart' })
+export class ExpenseChartComponent implements OnInit {
+  @Input() data: CategorySummary[] = [];
+
+  ngOnInit() {
+    const ctx = document.getElementById('expenseChart') as HTMLCanvasElement;
+    new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: this.data.map(d => d.category_name),
+        datasets: [{ data: this.data.map(d => d.total), backgroundColor: this.data.map(d => d.color) }]
+      },
+      options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+    });
+  }
+}
+```
+
+### 7.2 `TransactionListComponent` — filtros avançados
+
+**Estado interno:**
+
+```typescript
+transactions: Transaction[] = [];
+filters = {
+  type:        '' as 'income' | 'expense' | '',
+  category_id: null as number | null,
+  account_id:  null as number | null,
+  date_from:   '',
+  date_to:     '',
+  search:      ''
+};
+currentPage = 1;
+totalPages  = 1;
+loading     = false;
+```
+
+**Comportamento:** pesquisa com `debounceTime(400)`, filtros combinados, paginação. Ao clicar numa transacção, abre `TransactionFormComponent` em modo edição via `MatDialog`.
+
+### 7.3 `BudgetsPageComponent` — orçamentos mensais
+
+Exibe um cartão por categoria de despesa com:
+- Nome da categoria e ícone
+- Montante orçamentado vs gasto real
+- `BudgetProgressComponent` (barra de progresso)
+- Cor da barra muda conforme percentagem: verde (< 70%), amarelo (70–90%), vermelho (> 90%)
+
+### 7.4 `GoalDetailComponent` — objectivo de poupança
+
+- Barra de progresso circular (CSS `conic-gradient`) com percentagem actual
+- Histórico de depósitos (opcionalmente via tabela de transacções com categoria especial)
+- Botão "Depositar" que abre modal com campo de valor
+- Estimativa de conclusão baseada na taxa média de poupança mensal
+
+### 7.5 `ReportsPageComponent` — exportação
+
+```typescript
+exportReport(format: 'csv' | 'pdf'): void {
+  const params = new HttpParams()
+    .set('format', format)
+    .set('date_from', this.dateFrom)
+    .set('date_to', this.dateTo);
+
+  const url = `${env.apiUrl}/reports/export?${params.toString()}&token=${this.auth.getToken()}`;
+  window.open(url, '_blank');
+}
+```
+
+---
+
+## 8. Integração com API Externa
+
+**Serviço:** [ExchangeRate API](https://www.exchangerate-api.com) — plano gratuito  
+**Endpoint:** `GET https://v6.exchangerate-api.com/v6/{KEY}/latest/AOA`
+
+**Utilização no sistema:**
+- Todas as quantias são armazenadas em AOA na base de dados
+- O utilizador pode seleccionar a divisa de visualização (AOA, USD, EUR)
+- O `CurrencyService` converte os valores em memória sem alterar os dados persistidos
+- O seletor de divisa está disponível na topbar, persistindo em `localStorage`
+
+---
+
+## 9. Funcionalidades Transversais
+
+### 9.1 Categorias pré-definidas
+
+Ao registar, o sistema cria automaticamente categorias padrão para o novo utilizador:
+
+**Receitas:** Salário, Negócio, Freelance, Investimento, Outros  
+**Despesas:** Alimentação, Habitação, Transporte, Saúde, Educação, Lazer, Vestuário, Outros
+
+### 9.2 Actualização automática de saldo
+
+O `TransactionModel.php` centraliza a lógica de reajuste de saldo:
+
+```php
+// models/Transaction.php
+public function create(array $data): int {
+    // 1. Inserir transacção
+    // 2. Actualizar saldo da conta:
+    $delta = $data['type'] === 'income' ? $data['amount'] : -$data['amount'];
+    $this->db->query(
+        "UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?",
+        [$delta, $data['account_id'], $data['user_id']]
+    );
+    return $lastInsertId;
+}
+
+public function delete(int $id, int $userId): bool {
+    // 1. Buscar transacção antes de eliminar (para reverter saldo)
+    // 2. Reverter o saldo na conta
+    // 3. Eliminar transacção
+}
+```
+
+### 9.3 Modo claro / escuro e i18n
+
+Implementação idêntica ao Mini E-commerce: `ThemeService` com signal, `I18nService` com ficheiros JSON, ambos com persistência em `localStorage` e aplicação no bootstrap via `AppComponent.ngOnInit()`.
+
+---
+
+## 10. Modelos TypeScript
+
+```typescript
+// account.model.ts
+export type AccountType = 'cash' | 'bank' | 'savings' | 'investment';
+export interface Account {
+  id: number; user_id: number; name: string; type: AccountType;
+  balance: number; currency: string; color: string; is_active: boolean;
+}
+
+// transaction.model.ts
+export type TransactionType = 'income' | 'expense';
+export interface Transaction {
+  id: number; user_id: number; account_id: number; category_id: number;
+  type: TransactionType; amount: number; description: string;
+  date: string; notes?: string; created_at: string;
+  // Joins
+  category_name?: string; category_color?: string; account_name?: string;
+}
+
+// budget.model.ts
+export interface Budget {
+  id: number; user_id: number; category_id: number;
+  month: number; year: number; amount: number;
+  // Campos calculados pelo backend
+  spent?: number; percentage?: number;
+}
+
+// goal.model.ts
+export type GoalStatus = 'active' | 'completed' | 'cancelled';
+export interface Goal {
+  id: number; user_id: number; name: string; description: string;
+  target_amount: number; current_amount: number; deadline?: string;
+  icon: string; color: string; status: GoalStatus;
+  // Campo calculado
+  progress_percentage?: number;
+}
+```
+
+---
+
+## 11. Checklist de desenvolvimento por fase
+
+### Fase 0 — Setup
+- [ ] Repositório GitHub criado com estrutura de commits definida
+- [ ] Scaffolding Angular com routing, SCSS e Angular Material
+- [ ] Estrutura de directorias PHP criada
+- [ ] Script SQL com as 7 tabelas e dados de seed (categorias padrão)
+- [ ] `config/database.php`, `helpers/JWT.php`, `helpers/Response.php`
+- [ ] `.htaccess` com URL rewrite + CORS configurado
+- [ ] `environments/environment.ts` com URLs e chave da API
+
+### Fase 1 — Autenticação
+- [ ] `AuthController.php` com register, login, logout, forgot/reset password
+- [ ] `AuthMiddleware.php` e `AdminMiddleware.php`
+- [ ] Criação automática de categorias padrão no registo
+- [ ] `AuthModule` Angular com os 4 componentes
+- [ ] `AuthService`, `TokenInterceptor`, `AuthGuard`, `AdminGuard`
+- [ ] `MainLayout` com sidebar e topbar (navegação base)
+
+### Fase 2 — Contas e Categorias
+- [ ] `AccountController.php` e `Account.php` CRUD
+- [ ] `CategoryController.php` e `Category.php` CRUD
+- [ ] `AccountsModule` com listagem e formulário
+- [ ] `CategoriesModule` com gestão de categorias (cor, ícone, tipo)
+- [ ] `CategoryIconComponent` e `AmountBadgeComponent` no SharedModule
+
+### Fase 3 — Transacções (núcleo do sistema)
+- [ ] `Transaction.php` com lógica de reajuste de saldo
+- [ ] `TransactionController.php` com filtros e paginação
+- [ ] Endpoint `GET /transactions/summary`
+- [ ] `TransactionsModule` com listagem, filtros e formulário
+- [ ] `TransactionItemComponent` no SharedModule
+- [ ] `PeriodSelectorComponent` no SharedModule
+
+### Fase 4 — Dashboard
+- [ ] `DashboardController.php` com summary, by-category e cashflow
+- [ ] `DashboardModule` com cards de resumo
+- [ ] `ExpenseChartComponent` (donut — Chart.js)
+- [ ] `CashflowChartComponent` (line — Chart.js)
+- [ ] `RecentTransactionsComponent`
+- [ ] Instalar Chart.js: `npm install chart.js`
+
+### Fase 5 — Orçamentos
+- [ ] `Budget.php` e `BudgetController.php`
+- [ ] Endpoint `GET /budgets/status` com comparação gasto vs orçamento
+- [ ] `BudgetsModule` com listagem de cartões por categoria
+- [ ] `BudgetProgressComponent` com cor dinâmica
+
+### Fase 6 — Objectivos de poupança
+- [ ] `Goal.php` e `GoalController.php` com endpoint de depósito
+- [ ] `GoalsModule` com listagem, formulário e detalhe
+- [ ] Barra circular de progresso em CSS puro
+
+### Fase 7 — Relatórios e exportação
+- [ ] `ReportController.php` com CSV (fputcsv) e PDF (HTML + headers)
+- [ ] `ReportsModule` com seletor de período e botões de exportação
+- [ ] Validação de ranges de datas
+
+### Fase 8 — Funcionalidades transversais
+- [ ] `CurrencyService` com ExchangeRate API e caching
+- [ ] Seletor de divisa na topbar (AOA / USD / EUR)
+- [ ] `CurrencyFormatPipe` com `pure: false`
+- [ ] `ThemeService` com toggle dark/light
+- [ ] `I18nService` com `pt.json` e `en.json` completos
+- [ ] `AdminModule` lazy-loaded com listagem de utilizadores
+
+### Fase 9 — Polish e entrega
+- [ ] Testes manuais de todos os fluxos críticos
+- [ ] Estados de loading com spinner em todas as chamadas HTTP
+- [ ] Estados vazios com `EmptyStateComponent`
+- [ ] Formulários com mensagens de erro de validação visíveis
+- [ ] Interface responsiva testada em mobile e desktop
+- [ ] Script SQL final revisto
+- [ ] Documento técnico (≤ 5 páginas)
+
+---
+
+## 12. Cobertura dos Requisitos Obrigatórios
+
+| Requisito | Implementação |
+|---|---|
+| Autenticação completa | Register, login, logout, forgot/reset password com JWT e hash bcrypt |
+| Base de dados ≥ 3 tabelas + CRUD | 7 tabelas relacionais, CRUD completo em todas |
+| API externa | ExchangeRate API — conversão AOA/USD/EUR em tempo real |
+| Interface responsiva | Angular Material com breakpoints xs → xl |
+| Modo claro e escuro | ThemeService + toggle na topbar + variáveis CSS |
+| Múltiplos idiomas | PT e EN com I18nService e ficheiros JSON |
+| Exportação de dados | CSV e PDF via PHP com range de datas personalizável |
+| Distinção de utilizadores | `user` e `admin` com permissões via JWT claim |
+| Permissões diferenciadas | AdminGuard no Angular + AdminMiddleware no PHP |
+
+---
+
+## 13. Diferencial face ao Mini E-commerce
+
+| Aspecto | Mini E-commerce | Gestão Financeira |
+|---|---|---|
+| Domínio | Transacções de compra entre utilizador e loja | Gestão patrimonial pessoal |
+| Estado central | Carrinho (BehaviorSubject) | Transacções + saldo da conta |
+| Visualização | Catálogo de produtos | Dashboard analítico com gráficos |
+| Exportação | PDF por encomenda | CSV/PDF com filtro de período |
+| API externa | Divisas para preços do catálogo | Divisas para visualização do saldo pessoal |
+| Complexidade dos dados | Snapshot de preço histórico | Consistência do saldo (reajuste em 3 operações) |
+| Módulo adicional | Carrinho + Checkout | Orçamentos + Objectivos de poupança |
+
+---
+
+*Documento de arquitectura — Sistema de Gestão Financeira Pessoal · Angular 17+ · PHP 8.x · MySQL · ISPTEC 2025/2026*
